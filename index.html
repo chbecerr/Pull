@@ -19,128 +19,102 @@
   const ctx = canvas.getContext('2d');
 
   // ---- Tunables -----------------------------------------------------------
-  const MAX_MULT = 10;          // multiplier at a full pull
-  const HALF_LIFE = 7;          // seconds for (mult-1) to halve
-  const MIN_SPEED = 0.40;       // ball speed at 1x, in screen-heights / second
-  const MAX_SPEED = 1.50;       // ball speed at max multiplier
+  const MAX_MULT = 10;          // energy / multiplier at a full pull
+  const DECAY_BASE = 0.20;      // energy lost per second (flat part)
+  const DECAY_PROP = 0.03;      // ...plus this fraction of current energy
+  const MIN_SPEED = 0.30;       // ball speed at 0 energy, screen-heights / second
+  const MAX_SPEED = 1.50;       // ball speed at max energy
   const BASE_POINTS = 10;       // points per bounce before multiplier
   const MAX_PULL = 0.38;        // full pull distance, fraction of screen height
   const MIN_PULL_PX = 24;       // shorter pulls are cancelled
-  const ORB_BOOST = 3;          // multiplier added by a green orb
-  const ORB_TYPES = {
-    red:   { life: 7, w: 55 },
-    green: { life: 6, w: 25 },
-    blue:  { life: 7, w: 20 },
-  };
   const MIN_ANGLE = 18 * Math.PI / 180; // keep launches off the horizontal
+  const ORB_BOOST = 3;          // energy added by a green orb
+  const ORB_LIFE = { red: 7, green: 6, blue: 7 };
+  const RAMP_SECONDS = 100;     // play time until red orbs reach full difficulty
+  const GREENS_FOR_BONUS = 5;
+  const BONUS_BALLS = 3;
+  const BONUS_TIME = 5;         // seconds per bonus ball
+  const MID_POINTS = 1500, SIDE_POINTS = 250;
 
   // ---- State --------------------------------------------------------------
   let W = 0, H = 0, dpr = 1;
-  let state = 'ready';          // ready | playing | over
-  let score = 0, mult = 1, best = 0, newBest = false;
+  let state = 'ready';          // ready | playing | bonus | countdown | over
+  let score = 0, mult = 1, best = 0, newBest = false, deathMsg = '';
   let ball, paddle;
-  let pointer = null;           // active pointer info
-  let flashes = [];             // bounce ring effects
-  let trail = [];
-  let lastT = 0;
-  let orbs = [], shield = false, spawnIn = 2.5, now = 0;
+  let pointer = null;
+  let flashes = [], trail = [];
+  let orbs = [], shield = false, spawnIn = 2.5, now = 0, lastT = 0;
+  let greens = 0, playTime = 0;
+  let saved = null, bonus = null, mb = null, cd = null, goFlash = 0;
 
   try { best = parseInt(localStorage.getItem('pull-best') || '0', 10) || 0; } catch (e) {}
 
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const diff = () => Math.min(1, playTime / RAMP_SECONDS);
+  const scoreMult = () => Math.max(1, mult);
+
   function resize() {
+    const oW = W, oH = H;
     dpr = Math.min(window.devicePixelRatio || 1, 3);
     W = window.innerWidth; H = window.innerHeight;
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const pw = Math.max(80, Math.min(W * 0.28, 150));
-    const prevX = paddle ? paddle.x / (paddle.W || W) : 0.5;
-    paddle = { w: pw, h: 12, x: prevX * W, y: H - Math.max(70, H * 0.09), W };
+    const px = paddle && oW ? paddle.x / oW : 0.5;
+    paddle = { w: pw, h: 12, x: px * W, y: H - Math.max(70, H * 0.09) };
     const r = Math.max(7, Math.min(W, H) * 0.02);
-    ball = { x: paddle.x, y: paddle.y - paddle.h / 2 - r, r, vx: 0, vy: 0 };
-    if (state === 'playing') reset();
+    const sx = oW ? W / oW : 1, sy = oH ? H / oH : 1;
+    if (!ball) ball = { x: 0, y: 0, r, vx: 0, vy: 0 };
+    else { ball.x *= sx; ball.y *= sy; ball.vx *= sx; ball.vy *= sy; ball.r = r; }
+    for (const o of orbs) { o.x *= sx; o.y *= sy; }
+    if (mb) { mb.x *= sx; mb.y *= sy; mb.vx *= sx; mb.vy *= sy; mb.r = r; }
+    if (saved) { saved.x *= sx; saved.y *= sy; saved.vx *= sx; saved.vy *= sy; saved.px *= sx; }
+    if (state === 'ready') placeBall();
   }
 
-  function reset() {
-    state = 'ready';
-    score = 0; mult = 1; newBest = false;
-    flashes = []; trail = [];
-    orbs = []; shield = false; spawnIn = 2.5;
-    paddle.x = W / 2;
+  function placeBall() {
     ball.x = paddle.x;
     ball.y = paddle.y - paddle.h / 2 - ball.r;
     ball.vx = ball.vy = 0;
   }
 
+  function reset() {
+    state = 'ready';
+    score = 0; mult = 1; newBest = false; deathMsg = '';
+    greens = 0; playTime = 0; goFlash = 0;
+    flashes = []; trail = []; orbs = []; shield = false; spawnIn = 2.5;
+    saved = null; bonus = null; mb = null; cd = null; pointer = null;
+    paddle.x = W / 2;
+    placeBall();
+  }
+
   // ---- Helpers ------------------------------------------------------------
-  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   function speedForMult(m) {
-    return (MIN_SPEED + (MAX_SPEED - MIN_SPEED) * ((m - 1) / (MAX_MULT - 1))) * H;
+    return (MIN_SPEED + (MAX_SPEED - MIN_SPEED) * clamp(m / MAX_MULT, 0, 1)) * H;
   }
   function pullInfo() {
-    // Returns aim direction + power for the current drag, or null if invalid.
     if (!pointer) return null;
     const dx = pointer.x - pointer.sx, dy = pointer.y - pointer.sy;
     const len = Math.hypot(dx, dy);
     if (dy <= 0 || len < MIN_PULL_PX) return { valid: false, len };
-    let ang = Math.atan2(-dy, -dx);              // opposite of the pull
-    // clamp away from horizontal; ang is in (-pi, 0) region mirrored upward
-    let ux = Math.cos(ang), uy = Math.sin(ang);  // uy < 0 (up)
+    const ang = Math.atan2(-dy, -dx);
+    let ux = Math.cos(ang), uy = Math.sin(ang);
     if (-uy < Math.sin(MIN_ANGLE)) {
-      const sx = ux >= 0 ? 1 : -1;
-      ux = sx * Math.cos(MIN_ANGLE); uy = -Math.sin(MIN_ANGLE);
+      ux = (ux >= 0 ? 1 : -1) * Math.cos(MIN_ANGLE); uy = -Math.sin(MIN_ANGLE);
     }
     const power = clamp(len / (MAX_PULL * H), 0, 1);
     return { valid: true, ux, uy, power, mult: 1 + (MAX_MULT - 1) * power, len };
   }
 
-  function spawnOrb() {
-    if (orbs.length >= 4) return;
-    let pool = Object.keys(ORB_TYPES).filter(k => !(k === 'blue' && (shield || orbs.some(o => o.type === 'blue'))));
-    let total = pool.reduce((a, k) => a + ORB_TYPES[k].w, 0), roll = Math.random() * total, type = pool[0];
-    for (const k of pool) { roll -= ORB_TYPES[k].w; if (roll <= 0) { type = k; break; } }
-    const r = Math.max(15, Math.min(W, H) * 0.045);
-    const top = Math.max(150, H * 0.3), bottom = paddle.y - 90;
-    for (let tries = 0; tries < 25; tries++) {
-      const x = r * 1.6 + Math.random() * (W - r * 3.2);
-      const y = top + Math.random() * Math.max(10, bottom - top);
-      if (Math.hypot(x - ball.x, y - ball.y) < r * 5) continue;
-      if (orbs.some(o => Math.hypot(x - o.x, y - o.y) < r * 3)) continue;
-      orbs.push({ type, x, y, r, age: 0, life: ORB_TYPES[type].life, seed: Math.random() * 6.28 });
-      return;
-    }
-  }
-
-  function popFlash(x, y, txt, col) { flashes.push({ x, y, t: 0, txt, col }); }
-
-  function hitOrb(o) {
-    if (o.type === 'red') {
-      if (shield) {
-        shield = false; orbs.splice(orbs.indexOf(o), 1);
-        popFlash(o.x, o.y, 'SHIELD!', '#4da3ff'); beep(660);
-        return false;
-      }
-      gameOver();
-      return true;
-    }
-    orbs.splice(orbs.indexOf(o), 1);
-    if (o.type === 'green') {
-      mult = Math.min(MAX_MULT, mult + ORB_BOOST);
-      popFlash(o.x, o.y, 'SPEED UP!', '#5dff7a'); beep(880);
-    } else {
-      shield = true;
-      popFlash(o.x, o.y, 'SHIELD', '#4da3ff'); beep(520);
-    }
-    return false;
-  }
-
   function bounce(x, y) {
-    const pts = Math.round(BASE_POINTS * mult);
+    const pts = Math.round(BASE_POINTS * scoreMult());
     score += pts;
     flashes.push({ x, y, t: 0, pts });
     if (navigator.vibrate) { try { navigator.vibrate(8); } catch (e) {} }
-    beep(220 + mult * 40);
+    beep(220 + scoreMult() * 40);
   }
+  function popFlash(x, y, txt, col) { flashes.push({ x, y, t: 0, txt, col }); }
 
   // ---- Audio (tiny, optional) --------------------------------------------
   let actx = null;
@@ -160,6 +134,61 @@
     try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
   }
 
+  // ---- Orbs ---------------------------------------------------------------
+  function spawnOrb(force) {
+    const d = diff();
+    const cap = 4 + Math.floor(2 * d);
+    if (!force && orbs.length >= cap) return;
+    let type = force;
+    if (!type) {
+      const wts = { red: 45 + 40 * d, green: 32, blue: (shield || orbs.some(o => o.type === 'blue')) ? 0 : 18 };
+      let roll = Math.random() * (wts.red + wts.green + wts.blue);
+      type = 'red';
+      for (const k of ['red', 'green', 'blue']) { roll -= wts[k]; if (roll <= 0) { type = k; break; } }
+    }
+    const base = Math.max(15, Math.min(W, H) * 0.045);
+    const r = type === 'red' ? base * (1 + 0.9 * d) : base;
+    const top = Math.max(150, H * 0.3), bottom = paddle.y - 90;
+    let x = 0, y = 0, ok = false;
+    for (let tries = 0; tries < 25 && !ok; tries++) {
+      x = r * 1.6 + Math.random() * (W - r * 3.2);
+      y = top + Math.random() * Math.max(10, bottom - top);
+      ok = Math.hypot(x - ball.x, y - ball.y) >= r * 3 + ball.r * 3 &&
+           !orbs.some(o => Math.hypot(x - o.x, y - o.y) < (r + o.r) * 1.5);
+    }
+    if (!ok && !force) return;
+    const o = { type, x, y, r, age: 0, life: ORB_LIFE[type], seed: Math.random() * 6.28, vx: 0 };
+    // As the game goes on, more red orbs patrol sideways, and faster.
+    if (type === 'red' && Math.random() < Math.pow(d, 0.8)) {
+      o.vx = (Math.random() < 0.5 ? -1 : 1) * W * (0.06 + 0.2 * d);
+    }
+    orbs.push(o);
+  }
+
+  // Returns true if the update loop must stop (game over / bonus began).
+  function hitOrb(o) {
+    if (o.type === 'red') {
+      if (shield) {
+        shield = false; orbs.splice(orbs.indexOf(o), 1);
+        popFlash(o.x, o.y, 'SHIELD!', '#4da3ff'); beep(660);
+        return false;
+      }
+      gameOver('Touched a red orb');
+      return true;
+    }
+    orbs.splice(orbs.indexOf(o), 1);
+    if (o.type === 'green') {
+      mult = Math.min(MAX_MULT, mult + ORB_BOOST);
+      greens++;
+      popFlash(o.x, o.y, 'POWER UP!', '#5dff7a'); beep(880);
+      if (greens >= GREENS_FOR_BONUS) { startBonus(); return true; }
+    } else {
+      shield = true;
+      popFlash(o.x, o.y, 'SHIELD', '#4da3ff'); beep(520);
+    }
+    return false;
+  }
+
   // ---- Input --------------------------------------------------------------
   canvas.addEventListener('pointerdown', e => {
     e.preventDefault();
@@ -169,6 +198,7 @@
       if (performance.now() - overAt > 600) reset();
       return;
     }
+    if (state === 'bonus' && bonus.phase !== 'aim') return;
     pointer = { id: e.pointerId, sx: e.clientX, sy: e.clientY, x: e.clientX, y: e.clientY, px: paddle.x };
     try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
   });
@@ -176,20 +206,23 @@
     if (!pointer || e.pointerId !== pointer.id) return;
     e.preventDefault();
     pointer.x = e.clientX; pointer.y = e.clientY;
-    if (state === 'playing') {
+    if (state === 'playing' || state === 'countdown') {
       paddle.x = clamp(pointer.px + (pointer.x - pointer.sx), paddle.w / 2, W - paddle.w / 2);
     }
   });
   function endPointer(e) {
     if (!pointer || e.pointerId !== pointer.id) return;
-    if (state === 'ready' && e.type === 'pointerup') {
+    if (e.type === 'pointerup') {
       const p = pullInfo();
-      if (p && p.valid) {
+      if (state === 'ready' && p && p.valid) {
         mult = p.mult;
         const s = speedForMult(mult);
         ball.vx = p.ux * s; ball.vy = p.uy * s;
-        state = 'playing';
-        trail = [];
+        state = 'playing'; trail = [];
+      } else if (state === 'bonus' && bonus.phase === 'aim' && p && p.valid) {
+        const s = (0.6 + 0.7 * p.power) * H;
+        mb.vx = p.ux * s; mb.vy = p.uy * s;
+        bonus.phase = 'fly'; trail = [];
       }
     }
     pointer = null;
@@ -199,10 +232,11 @@
   window.addEventListener('contextmenu', e => e.preventDefault());
   window.addEventListener('resize', resize);
 
-  // ---- Update -------------------------------------------------------------
+  // ---- Game over ----------------------------------------------------------
   let overAt = 0;
-  function gameOver() {
+  function gameOver(msg) {
     state = 'over';
+    deathMsg = msg || '';
     overAt = performance.now();
     pointer = null;
     if (score > best) {
@@ -212,27 +246,152 @@
     beep(110);
   }
 
-  function update(dt) {
-    for (const f of flashes) f.t += dt;
-    flashes = flashes.filter(f => f.t < 0.7);
-    if (state !== 'playing') return;
+  // ---- Bonus minigame -----------------------------------------------------
+  const ceilY = () => Math.max(140, H * 0.2);
+  function holeDefs() {
+    const r = ball.r, cx = W / 2, off = Math.min(W * 0.27, W / 2 - r * 6);
+    return [
+      { x: cx - off, hw: r * 4.6, pts: SIDE_POINTS },
+      { x: cx,       hw: r * 2.1, pts: MID_POINTS },
+      { x: cx + off, hw: r * 4.6, pts: SIDE_POINTS },
+    ];
+  }
+  const bonusStart = () => ({ x: W / 2, y: H - Math.max(110, H * 0.14) });
 
-    // Orbs: age, expire, spawn
-    for (const o of orbs) o.age += dt;
+  function startBonus() {
+    // Remember exactly where the ball was and where it was heading.
+    saved = { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy, px: paddle.x };
+    orbs = []; trail = []; pointer = null; greens = 0;
+    state = 'bonus';
+    bonus = { phase: 'intro', t: 0, idx: 0, total: 0, results: [], timeLeft: BONUS_TIME, msg: '', hole: null };
+    mb = null;
+    beep(990);
+  }
+
+  function beginBall() {
+    const s = bonusStart();
+    mb = { x: s.x, y: s.y, r: ball.r, vx: 0, vy: 0 };
+    bonus.phase = 'aim'; bonus.t = 0; bonus.timeLeft = BONUS_TIME; bonus.hole = null;
+    trail = [];
+  }
+
+  function endBall(pts, msg) {
+    bonus.results.push(pts);
+    bonus.total += pts;
+    score += pts;
+    bonus.msg = msg;
+    bonus.phase = 'between'; bonus.t = 0;
+    pointer = null;
+    mb = null;
+  }
+
+  function updateBonus(dt) {
+    const b = bonus;
+    b.t += dt;
+    if (b.phase === 'intro') {
+      if (b.t > 2.2) beginBall();
+    } else if (b.phase === 'aim' || b.phase === 'fly') {
+      b.timeLeft -= dt;
+      if (b.phase === 'fly') flyBonusBall(dt);
+      if (bonus.phase !== 'sink' && bonus.phase !== 'between' && b.timeLeft <= 0) {
+        endBall(0, "TIME'S UP");
+      }
+    } else if (b.phase === 'sink') {
+      if (b.t >= 0.4) {
+        const h = b.hole, cy = ceilY();
+        popFlash(h.x, cy - 40, '+' + h.pts, h.pts === MID_POINTS ? '#ffd24d' : '#ff9ae8');
+        beep(h.pts === MID_POINTS ? 1200 : 760);
+        endBall(h.pts, '+' + h.pts);
+      }
+    } else if (b.phase === 'between') {
+      if (b.t > 1.1) {
+        b.idx++;
+        if (b.idx >= BONUS_BALLS) { b.phase = 'done'; b.t = 0; }
+        else beginBall();
+      }
+    } else if (b.phase === 'done') {
+      if (b.t > 2) endBonus();
+    }
+  }
+
+  function flyBonusBall(dt) {
+    const r = mb.r, cy = ceilY();
+    const steps = Math.max(1, Math.ceil(Math.hypot(mb.vx, mb.vy) * dt / (r * 0.6)));
+    const h = dt / steps;
+    for (let i = 0; i < steps; i++) {
+      mb.x += mb.vx * h; mb.y += mb.vy * h;
+      if (mb.x < r) { mb.x = r; mb.vx = Math.abs(mb.vx); }
+      else if (mb.x > W - r) { mb.x = W - r; mb.vx = -Math.abs(mb.vx); }
+      if (mb.vy < 0 && mb.y - r <= cy) {
+        const hole = holeDefs().find(hd => Math.abs(mb.x - hd.x) <= hd.hw - r * 0.3);
+        if (hole) {
+          bonus.phase = 'sink'; bonus.t = 0; bonus.hole = hole;
+          bonus.fromX = mb.x; bonus.fromY = mb.y;
+          mb.vx = mb.vy = 0;
+          return;
+        }
+        mb.y = cy + r; mb.vy = Math.abs(mb.vy);
+        beep(300);
+      }
+      if (mb.y - r > H) { endBall(0, 'MISSED'); return; }
+    }
+    trail.push({ x: mb.x, y: mb.y });
+    if (trail.length > 14) trail.shift();
+  }
+
+  function endBonus() {
+    ball.x = saved.x; ball.y = saved.y; ball.vx = saved.vx; ball.vy = saved.vy;
+    paddle.x = clamp(saved.px, paddle.w / 2, W - paddle.w / 2);
+    bonus = null; mb = null; trail = []; pointer = null;
+    state = 'countdown'; cd = { t: 0 };
+  }
+
+  // Countdown segments: Get ready! / 3 / 2 / 1, then the game resumes with "GO!"
+  const CD_STEPS = [['Get ready!', 0.9], ['3', 0.8], ['2', 0.8], ['1', 0.8]];
+  function cdLabel() {
+    let t = cd.t;
+    for (const [label, len] of CD_STEPS) { if (t < len) return { label, k: t / len }; t -= len; }
+    return null;
+  }
+  function updateCountdown(dt) {
+    cd.t += dt;
+    if (!cdLabel()) {
+      state = 'playing'; cd = null; goFlash = 0.8; spawnIn = 2;
+      beep(1000);
+    }
+  }
+
+  // ---- Playing ------------------------------------------------------------
+  function updatePlaying(dt) {
+    playTime += dt;
+
+    for (const o of orbs) {
+      o.age += dt;
+      if (o.vx) {
+        o.x += o.vx * dt;
+        if (o.x < o.r) { o.x = o.r; o.vx = Math.abs(o.vx); }
+        else if (o.x > W - o.r) { o.x = W - o.r; o.vx = -Math.abs(o.vx); }
+      }
+    }
     orbs = orbs.filter(o => o.age < o.life);
-    spawnIn -= dt;
-    if (spawnIn <= 0) { spawnOrb(); spawnIn = 2 + Math.random() * 2.5; }
 
-    // Multiplier decays; ball speed follows it.
-    mult = 1 + (mult - 1) * Math.pow(0.5, dt / HALF_LIFE);
-    if (mult < 1.005) mult = 1;
+    // Running low on power? Make sure a green orb turns up soon.
+    if (mult < 2.5 && !orbs.some(o => o.type === 'green') && spawnIn > 0.8) spawnIn = 0.8;
+    spawnIn -= dt;
+    if (spawnIn <= 0) {
+      const needGreen = mult < 2.5 && !orbs.some(o => o.type === 'green');
+      spawnOrb(needGreen ? 'green' : undefined);
+      spawnIn = (2 + Math.random() * 2.5) * (1 - 0.35 * diff());
+    }
+
+    // Energy drains; the ball slows as it does. At zero the ball dies.
+    mult -= (DECAY_BASE + DECAY_PROP * mult) * dt;
+    if (mult <= 0) { mult = 0; gameOver('Out of power'); return; }
     const sp = speedForMult(mult);
     const cur = Math.hypot(ball.vx, ball.vy) || 1;
     ball.vx *= sp / cur; ball.vy *= sp / cur;
 
-    // Sub-step so fast balls never tunnel through the paddle.
-    const dist = sp * dt;
-    const steps = Math.max(1, Math.ceil(dist / (ball.r * 0.6)));
+    const steps = Math.max(1, Math.ceil(sp * dt / (ball.r * 0.6)));
     const h = dt / steps;
     for (let i = 0; i < steps; i++) {
       ball.x += ball.vx * h; ball.y += ball.vy * h;
@@ -241,12 +400,11 @@
       else if (ball.x > W - ball.r) { ball.x = W - ball.r; ball.vx = -Math.abs(ball.vx); bounce(ball.x, ball.y); }
       if (ball.y < ball.r) { ball.y = ball.r; ball.vy = Math.abs(ball.vy); bounce(ball.x, ball.y); }
 
-      // Paddle
       const top = paddle.y - paddle.h / 2;
       if (ball.vy > 0 && ball.y + ball.r >= top && ball.y - ball.r <= paddle.y + paddle.h / 2 &&
           ball.x >= paddle.x - paddle.w / 2 - ball.r * 0.5 && ball.x <= paddle.x + paddle.w / 2 + ball.r * 0.5) {
         const off = clamp((ball.x - paddle.x) / (paddle.w / 2), -1, 1);
-        const ang = off * 62 * Math.PI / 180;           // from vertical
+        const ang = off * 62 * Math.PI / 180;
         const s = Math.hypot(ball.vx, ball.vy);
         ball.vx = Math.sin(ang) * s; ball.vy = -Math.cos(ang) * s;
         ball.y = top - ball.r;
@@ -261,26 +419,109 @@
         }
       }
 
-      if (ball.y - ball.r > H) { gameOver(); return; }
+      if (ball.y - ball.r > H) { gameOver('Ball dropped'); return; }
     }
 
     trail.push({ x: ball.x, y: ball.y });
     if (trail.length > 14) trail.shift();
   }
 
-  // ---- Render -------------------------------------------------------------
-  function multColor(m) {
-    const t = (m - 1) / (MAX_MULT - 1);
-    return `hsl(${200 - 170 * t}, 95%, 62%)`; // cyan -> orange/red
+  function update(dt) {
+    for (const f of flashes) f.t += dt;
+    flashes = flashes.filter(f => f.t < 0.9);
+    if (goFlash > 0) goFlash -= dt;
+    if (state === 'playing') updatePlaying(dt);
+    else if (state === 'bonus') updateBonus(dt);
+    else if (state === 'countdown') updateCountdown(dt);
   }
 
-  function draw() {
-    // background
-    const g = ctx.createLinearGradient(0, 0, 0, H);
-    g.addColorStop(0, '#0d0d1f'); g.addColorStop(1, '#07070f');
-    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // ---- Render helpers -----------------------------------------------------
+  function multColor(m) {
+    const t = clamp((m - 1) / (MAX_MULT - 1), 0, 1);
+    return `hsl(${200 - 170 * t}, 95%, 62%)`;
+  }
 
-    // walls (glow on left/right/top; bottom is the danger edge)
+  // Ball look: dim and cold at low energy, bright and hot at high energy.
+  function ballStyle() {
+    if (state === 'ready') return { col: '#fff', alpha: 1, glow: 18 };
+    const e = clamp(mult / MAX_MULT, 0, 1), k = Math.pow(e, 0.6);
+    return { col: `hsl(${200 - 170 * e}, 90%, ${28 + 44 * k}%)`, alpha: 0.28 + 0.72 * k, glow: 2 + 32 * k };
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+
+  // Dotted path preview that bounces off the side walls and a ceiling at topY.
+  function drawPath(x, y, vx, vy, length, topY, col, maxAlpha) {
+    ctx.fillStyle = col;
+    let left = length, n = 0;
+    const total = length;
+    while (left > 0 && n++ < 500) {
+      const step = 14;
+      x += vx * step; y += vy * step; left -= step;
+      if (x < ball.r) { x = ball.r; vx = Math.abs(vx); }
+      if (x > W - ball.r) { x = W - ball.r; vx = -Math.abs(vx); }
+      if (y < topY + ball.r) break;
+      ctx.globalAlpha = Math.max(0.1, (left / total) * maxAlpha);
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, 7); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawRubberBand(p) {
+    const col = multColor(p.mult);
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(pointer.sx, pointer.sy); ctx.lineTo(pointer.x, pointer.y); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.beginPath(); ctx.arc(pointer.sx, pointer.sy, 6, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(pointer.x, pointer.y, 10, 0, 7); ctx.fillStyle = col; ctx.fill();
+    return col;
+  }
+
+  function drawArrow(x, y, ux, uy) {
+    const len = 72 + 8 * Math.sin(now * 6);
+    const x0 = x + ux * (ball.r + 10), y0 = y + uy * (ball.r + 10);
+    const x1 = x0 + ux * len, y1 = y0 + uy * len;
+    const nx = -uy, ny = ux;
+    ctx.save();
+    ctx.strokeStyle = '#ff7ae6'; ctx.fillStyle = '#ff7ae6';
+    ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 14;
+    ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x1 + ux * 16, y1 + uy * 16);
+    ctx.lineTo(x1 + nx * 11, y1 + ny * 11);
+    ctx.lineTo(x1 - nx * 11, y1 - ny * 11);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  // ---- Render: scene pieces ----------------------------------------------
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    if (state === 'bonus') { g.addColorStop(0, '#1b0a2a'); g.addColorStop(1, '#0b0414'); }
+    else { g.addColorStop(0, '#0d0d1f'); g.addColorStop(1, '#07070f'); }
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  }
+
+  function drawWalls() {
+    if (state === 'bonus') {
+      // pink glowing edges all the way round
+      const pulse = 0.5 + 0.5 * Math.sin(now * 5);
+      ctx.save();
+      for (let i = 0; i < 3; i++) {
+        ctx.strokeStyle = `rgba(255,79,216,${0.9 - i * 0.28})`;
+        ctx.lineWidth = 4 + i * 5;
+        ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 16 + pulse * 14 + i * 6;
+        ctx.strokeRect(2, 2, W - 4, H - 4);
+      }
+      ctx.restore();
+      return;
+    }
     ctx.lineWidth = 3;
     ctx.strokeStyle = '#2a3b6b';
     ctx.shadowColor = '#4d7cff'; ctx.shadowBlur = 12;
@@ -289,70 +530,56 @@
     const dg = ctx.createLinearGradient(0, H - 24, 0, H);
     dg.addColorStop(0, 'rgba(255,60,80,0)'); dg.addColorStop(1, 'rgba(255,60,80,0.55)');
     ctx.fillStyle = dg; ctx.fillRect(0, H - 24, W, 24);
+  }
 
-    // HUD
+  function drawStage() {
     ctx.textAlign = 'center';
+    const hudY = Math.max(70, H * 0.1);
     ctx.fillStyle = 'rgba(255,255,255,0.92)';
     ctx.font = `700 ${Math.round(Math.min(W * 0.14, 64))}px system-ui, sans-serif`;
-    ctx.fillText(String(score), W / 2, Math.max(70, H * 0.1));
-    ctx.font = `500 13px system-ui, sans-serif`;
+    ctx.fillText(String(score), W / 2, hudY);
+    ctx.font = '500 13px system-ui, sans-serif';
     ctx.fillStyle = 'rgba(255,255,255,0.45)';
-    ctx.fillText('BEST ' + best, W / 2, Math.max(70, H * 0.1) + 22);
+    ctx.fillText('BEST ' + best, W / 2, hudY + 22);
 
-    // multiplier readout + bar
-    const showMult = state === 'playing' ? mult : (pointer && pullInfo() && pullInfo().valid ? pullInfo().mult : 0);
-    if (showMult) {
-      const col = multColor(showMult);
-      ctx.fillStyle = col;
-      ctx.shadowColor = col; ctx.shadowBlur = 16;
+    const pi = pointer && state === 'ready' ? pullInfo() : null;
+    const showMult = state === 'playing' || state === 'countdown' ? mult : (pi && pi.valid ? pi.mult : 0);
+    if (showMult || state === 'playing') {
+      const low = state === 'playing' && showMult < 1.5;
+      const blink = low ? (Math.sin(now * 12) > 0 ? 1 : 0.35) : 1;
+      const col = low ? '#ff4a5a' : multColor(showMult);
+      ctx.globalAlpha = blink;
+      ctx.fillStyle = col; ctx.shadowColor = col; ctx.shadowBlur = 16;
       ctx.font = `800 ${Math.round(Math.min(W * 0.09, 40))}px system-ui, sans-serif`;
-      ctx.fillText('×' + showMult.toFixed(1), W / 2, Math.max(70, H * 0.1) + 68);
+      ctx.fillText('×' + Math.max(1, showMult).toFixed(1), W / 2, hudY + 68);
       ctx.shadowBlur = 0;
-      const bw = Math.min(W * 0.5, 220), bx = W / 2 - bw / 2, by = Math.max(70, H * 0.1) + 82;
+      const bw = Math.min(W * 0.5, 220), bx = W / 2 - bw / 2, by = hudY + 82;
       ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.fillRect(bx, by, bw, 5);
-      ctx.fillStyle = col; ctx.fillRect(bx, by, bw * (showMult - 1) / (MAX_MULT - 1), 5);
-    }
-
-    // aim line
-    if (state === 'ready' && pointer) {
-      const p = pullInfo();
-      if (p && p.valid) {
-        const col = multColor(p.mult);
-        // pull rubber band from start to finger
-        ctx.strokeStyle = 'rgba(255,255,255,0.18)'; ctx.lineWidth = 2; ctx.setLineDash([]);
-        ctx.beginPath(); ctx.moveTo(pointer.sx, pointer.sy); ctx.lineTo(pointer.x, pointer.y); ctx.stroke();
-        ctx.fillStyle = 'rgba(255,255,255,0.25)';
-        ctx.beginPath(); ctx.arc(pointer.sx, pointer.sy, 6, 0, 7); ctx.fill();
-        ctx.beginPath(); ctx.arc(pointer.x, pointer.y, 10, 0, 7); ctx.fillStyle = col; ctx.fill();
-        // trajectory preview (bounces off side walls)
-        let x = ball.x, y = ball.y, vx = p.ux, vy = p.uy, left = H * (0.25 + 0.5 * p.power);
-        ctx.fillStyle = col;
-        let n = 0;
-        while (left > 0 && y > 0 && n++ < 400) {
-          const step = 14;
-          x += vx * step; y += vy * step; left -= step;
-          if (x < ball.r) { x = ball.r; vx = Math.abs(vx); }
-          if (x > W - ball.r) { x = W - ball.r; vx = -Math.abs(vx); }
-          if (y < ball.r) break;
-          ctx.globalAlpha = Math.max(0.1, left / (H * 0.75));
-          ctx.beginPath(); ctx.arc(x, y, 3, 0, 7); ctx.fill();
-        }
-        ctx.globalAlpha = 1;
+      ctx.fillStyle = col; ctx.fillRect(bx, by, bw * clamp(showMult / MAX_MULT, 0, 1), 5);
+      ctx.globalAlpha = 1;
+      if (low) {
+        ctx.fillStyle = `rgba(255,90,100,${blink})`;
+        ctx.font = '700 12px system-ui, sans-serif';
+        ctx.fillText('LOW POWER - grab a green orb!', W / 2, by + 22);
       }
     }
 
-    // bounce flashes
-    for (const f of flashes) {
-      const k = f.t / 0.7;
-      ctx.globalAlpha = 1 - k;
-      ctx.strokeStyle = f.col || multColor(mult); ctx.lineWidth = 2;
-      ctx.beginPath(); ctx.arc(f.x, f.y, ball.r + k * 26, 0, 7); ctx.stroke();
-      ctx.fillStyle = f.col || '#fff'; ctx.font = '700 14px system-ui, sans-serif';
-      ctx.fillText(f.txt || '+' + f.pts, f.x, f.y - 14 - k * 24);
-      ctx.globalAlpha = 1;
+    // green-orb progress toward the bonus round
+    {
+      const py = hudY + 118, gap = 20;
+      for (let i = 0; i < GREENS_FOR_BONUS; i++) {
+        const x = W / 2 + (i - (GREENS_FOR_BONUS - 1) / 2) * gap;
+        ctx.beginPath(); ctx.arc(x, py, 5.5, 0, 7);
+        if (i < greens) { ctx.fillStyle = '#5dff7a'; ctx.shadowColor = '#5dff7a'; ctx.shadowBlur = 10; ctx.fill(); ctx.shadowBlur = 0; }
+        else { ctx.strokeStyle = 'rgba(120,255,150,0.35)'; ctx.lineWidth = 1.5; ctx.stroke(); }
+      }
     }
 
-    // orbs
+    if (pi && pi.valid) {
+      const col = drawRubberBand(pi);
+      drawPath(ball.x, ball.y, pi.ux, pi.uy, H * (0.25 + 0.5 * pi.power), 0, col, 1);
+    }
+
     for (const o of orbs) drawOrb(o);
 
     // paddle
@@ -361,16 +588,16 @@
     ctx.shadowBlur = 0;
 
     // trail + ball
-    const bc = state === 'playing' ? multColor(mult) : '#ffffff';
+    const bs = ballStyle();
     for (let i = 0; i < trail.length; i++) {
-      ctx.globalAlpha = (i / trail.length) * 0.35;
-      ctx.fillStyle = bc;
+      ctx.globalAlpha = (i / trail.length) * 0.35 * bs.alpha;
+      ctx.fillStyle = bs.col;
       ctx.beginPath(); ctx.arc(trail[i].x, trail[i].y, ball.r * (0.4 + 0.6 * i / trail.length), 0, 7); ctx.fill();
     }
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = bc; ctx.shadowColor = bc; ctx.shadowBlur = 18;
+    ctx.globalAlpha = bs.alpha;
+    ctx.fillStyle = bs.col; ctx.shadowColor = bs.col; ctx.shadowBlur = bs.glow;
     ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r, 0, 7); ctx.fill();
-    ctx.shadowBlur = 0;
+    ctx.shadowBlur = 0; ctx.globalAlpha = 1;
     if (shield) {
       ctx.strokeStyle = `rgba(90,170,255,${0.7 + 0.3 * Math.sin(now * 8)})`; ctx.lineWidth = 3;
       ctx.shadowColor = '#4da3ff'; ctx.shadowBlur = 14;
@@ -378,8 +605,13 @@
       ctx.shadowBlur = 0;
     }
 
-    // messages
-    ctx.textAlign = 'center';
+    if (state === 'countdown') {
+      const sp = Math.hypot(saved ? saved.vx : ball.vx, saved ? saved.vy : ball.vy) || 1;
+      const ux = ball.vx / sp, uy = ball.vy / sp;
+      drawPath(ball.x, ball.y, ux, uy, H * 0.35, 0, '#ff7ae6', 0.8);
+      drawArrow(ball.x, ball.y, ux, uy);
+    }
+
     if (state === 'ready' && !pointer) {
       ctx.fillStyle = 'rgba(255,255,255,0.85)';
       ctx.font = `700 ${Math.round(Math.min(W * 0.07, 30))}px system-ui, sans-serif`;
@@ -387,28 +619,194 @@
       ctx.font = '500 15px system-ui, sans-serif';
       ctx.fillStyle = 'rgba(255,255,255,0.5)';
       ctx.fillText('Harder pull = faster ball = bigger multiplier', W / 2, H * 0.5 + 28);
-      ctx.fillText('Then drag left and right to move the paddle', W / 2, H * 0.5 + 50);
+      ctx.fillText('Drag left and right to move the paddle', W / 2, H * 0.5 + 50);
       ctx.fillStyle = '#ff6b6b'; ctx.fillText('Red orbs end the game', W / 2, H * 0.5 + 82);
-      ctx.fillStyle = '#6dff85'; ctx.fillText('Green orbs boost your speed', W / 2, H * 0.5 + 104);
+      ctx.fillStyle = '#6dff85'; ctx.fillText('Green orbs recharge your ball', W / 2, H * 0.5 + 104);
       ctx.fillStyle = '#6db4ff'; ctx.fillText('Blue orbs block one red orb', W / 2, H * 0.5 + 126);
+      ctx.fillStyle = '#ff8ae8'; ctx.fillText('5 green orbs = bonus round', W / 2, H * 0.5 + 148);
+      ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.fillText('A ball with no power dies!', W / 2, H * 0.5 + 176);
+    }
+  }
+
+  function drawBonus() {
+    const b = bonus, cy = ceilY(), holes = holeDefs();
+    const fade = Math.min(1, b.t / 0.5);
+    ctx.textAlign = 'center';
+
+    // ceiling with three scoring pockets
+    ctx.save();
+    ctx.globalAlpha = b.phase === 'intro' ? fade : 1;
+    const barG = ctx.createLinearGradient(0, cy - 34, 0, cy);
+    barG.addColorStop(0, '#4a1a66'); barG.addColorStop(1, '#2a0d3d');
+    ctx.fillStyle = barG; ctx.fillRect(0, cy - 34, W, 34);
+    ctx.strokeStyle = '#ff4fd8'; ctx.lineWidth = 2; ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(W, cy); ctx.stroke();
+    ctx.shadowBlur = 0;
+    for (const hd of holes) {
+      const mid = hd.pts === MID_POINTS, col = mid ? '#ffd24d' : '#ff9ae8';
+      ctx.fillStyle = '#06020b';
+      ctx.fillRect(hd.x - hd.hw, cy - 34, hd.hw * 2, 34);
+      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.shadowColor = col; ctx.shadowBlur = mid ? 14 : 8;
+      ctx.strokeRect(hd.x - hd.hw, cy - 34, hd.hw * 2, 34);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = col;
+      ctx.font = `800 ${mid ? 11 : 15}px system-ui, sans-serif`;
+      ctx.fillText(String(hd.pts), hd.x, cy - 12);
+    }
+    ctx.restore();
+
+    // HUD
+    ctx.fillStyle = '#ff7ae6'; ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 14;
+    ctx.font = '800 20px system-ui, sans-serif';
+    ctx.fillText('BONUS ROUND', W / 2, 32);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fff';
+    ctx.font = '700 26px system-ui, sans-serif';
+    ctx.fillText(String(score), W / 2, 64);
+    for (let i = 0; i < BONUS_BALLS; i++) {
+      const x = W / 2 + (i - 1) * 22, y = 84;
+      ctx.beginPath(); ctx.arc(x, y, 6, 0, 7);
+      if (i < b.results.length) { ctx.fillStyle = b.results[i] > 0 ? '#ff7ae6' : 'rgba(255,255,255,0.25)'; ctx.fill(); }
+      else {
+        ctx.strokeStyle = i === b.idx ? '#fff' : 'rgba(255,255,255,0.3)'; ctx.lineWidth = 2; ctx.stroke();
+      }
+    }
+
+    // timer
+    if (b.phase === 'aim' || b.phase === 'fly' || b.phase === 'sink') {
+      const frac = clamp(b.timeLeft / BONUS_TIME, 0, 1);
+      const bw = Math.min(W * 0.6, 260), bx = W / 2 - bw / 2, by = H - 30;
+      const danger = b.timeLeft < 1.5;
+      ctx.fillStyle = 'rgba(255,255,255,0.1)'; ctx.fillRect(bx, by, bw, 6);
+      ctx.fillStyle = danger ? '#ff4a5a' : '#ff7ae6'; ctx.fillRect(bx, by, bw * frac, 6);
+      ctx.fillStyle = danger ? '#ff4a5a' : 'rgba(255,255,255,0.8)';
+      ctx.font = '700 15px system-ui, sans-serif';
+      ctx.fillText(Math.max(0, b.timeLeft).toFixed(1) + 's', W / 2, by - 8);
+    }
+
+    // ball, aim and launcher
+    if (mb && (b.phase === 'aim' || b.phase === 'fly' || b.phase === 'sink')) {
+      if (b.phase === 'aim') {
+        const s = bonusStart();
+        ctx.strokeStyle = 'rgba(255,122,230,0.5)'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(s.x, s.y, mb.r + 10, 0, 7); ctx.stroke();
+        const pi = pointer ? pullInfo() : null;
+        if (pi && pi.valid) {
+          const col = drawRubberBand(pi);
+          drawPath(mb.x, mb.y, pi.ux, pi.uy, H * (0.35 + 0.6 * pi.power), cy, col, 1);
+        } else if (!pointer) {
+          ctx.fillStyle = 'rgba(255,255,255,0.75)';
+          ctx.font = '600 16px system-ui, sans-serif';
+          ctx.fillText('Pull down to slingshot', W / 2, H * 0.62);
+        }
+      }
+      for (let i = 0; i < trail.length; i++) {
+        ctx.globalAlpha = (i / trail.length) * 0.35;
+        ctx.fillStyle = '#ff9ae8';
+        ctx.beginPath(); ctx.arc(trail[i].x, trail[i].y, mb.r * (0.4 + 0.6 * i / trail.length), 0, 7); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      let bx = mb.x, by = mb.y, br = mb.r;
+      if (b.phase === 'sink') {
+        const k = Math.min(1, b.t / 0.4);
+        bx = b.fromX + (b.hole.x - b.fromX) * k;
+        by = b.fromY + ((cy - 17) - b.fromY) * k;
+        br = mb.r * (1 - 0.6 * k);
+      }
+      ctx.fillStyle = '#fff'; ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 20;
+      ctx.beginPath(); ctx.arc(bx, by, br, 0, 7); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // phase messages
+    if (b.phase === 'intro') {
+      ctx.globalAlpha = fade;
+      ctx.fillStyle = '#ff7ae6'; ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 18;
+      ctx.font = `800 ${Math.round(Math.min(W * 0.1, 44))}px system-ui, sans-serif`;
+      ctx.fillText('BONUS!', W / 2, H * 0.45);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.font = '600 17px system-ui, sans-serif';
+      ctx.fillText('Slingshot 3 balls into the holes', W / 2, H * 0.45 + 34);
+      ctx.fillStyle = '#ffd24d';
+      ctx.fillText('Small middle hole = ' + MID_POINTS + ' points', W / 2, H * 0.45 + 62);
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.fillText(BONUS_TIME + ' seconds per ball', W / 2, H * 0.45 + 90);
+      ctx.globalAlpha = 1;
+    } else if (b.phase === 'between') {
+      ctx.fillStyle = b.msg.charAt(0) === '+' ? '#ffd24d' : '#ff6b8a';
+      ctx.font = `800 ${Math.round(Math.min(W * 0.1, 44))}px system-ui, sans-serif`;
+      ctx.fillText(b.msg, W / 2, H * 0.5);
+    } else if (b.phase === 'done') {
+      ctx.fillStyle = '#ff7ae6'; ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 16;
+      ctx.font = `800 ${Math.round(Math.min(W * 0.09, 40))}px system-ui, sans-serif`;
+      ctx.fillText('BONUS TOTAL', W / 2, H * 0.45);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#ffd24d';
+      ctx.font = `800 ${Math.round(Math.min(W * 0.16, 72))}px system-ui, sans-serif`;
+      ctx.fillText('+' + b.total, W / 2, H * 0.45 + 70);
+    }
+  }
+
+  function drawFlashes() {
+    ctx.textAlign = 'center';
+    for (const f of flashes) {
+      const k = f.t / 0.9;
+      ctx.globalAlpha = 1 - k;
+      ctx.strokeStyle = f.col || multColor(mult); ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(f.x, f.y, ball.r + k * 26, 0, 7); ctx.stroke();
+      ctx.fillStyle = f.col || '#fff'; ctx.font = '700 14px system-ui, sans-serif';
+      ctx.fillText(f.txt || '+' + f.pts, f.x, f.y - 14 - k * 24);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawOverlays() {
+    ctx.textAlign = 'center';
+    if (state === 'countdown' && cd) {
+      const c = cdLabel();
+      if (c) {
+        const big = c.label.length === 1;
+        ctx.save();
+        ctx.globalAlpha = 1 - 0.6 * c.k;
+        ctx.fillStyle = '#ff9af0'; ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 22;
+        const sc = big ? 1.25 - 0.25 * c.k : 1;
+        ctx.font = `800 ${Math.round((big ? 110 : 44) * sc * Math.min(1, W / 390))}px system-ui, sans-serif`;
+        ctx.fillText(c.label, W / 2, H * 0.42);
+        ctx.restore();
+      }
+    }
+    if (goFlash > 0) {
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, goFlash / 0.5);
+      ctx.fillStyle = '#6dff85'; ctx.shadowColor = '#3dff6a'; ctx.shadowBlur = 22;
+      ctx.font = `800 ${Math.round(80 * Math.min(1, W / 390))}px system-ui, sans-serif`;
+      ctx.fillText('GO!', W / 2, H * 0.42);
+      ctx.restore();
     }
     if (state === 'over') {
       ctx.fillStyle = 'rgba(5,5,12,0.72)'; ctx.fillRect(0, 0, W, H);
       ctx.fillStyle = '#ff5a6e';
       ctx.font = `800 ${Math.round(Math.min(W * 0.12, 54))}px system-ui, sans-serif`;
       ctx.fillText('GAME OVER', W / 2, H * 0.38);
+      if (deathMsg) {
+        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.font = '600 15px system-ui, sans-serif';
+        ctx.fillText(deathMsg, W / 2, H * 0.38 + 26);
+      }
       ctx.fillStyle = '#fff';
       ctx.font = `700 ${Math.round(Math.min(W * 0.16, 72))}px system-ui, sans-serif`;
-      ctx.fillText(String(score), W / 2, H * 0.38 + 80);
+      ctx.fillText(String(score), W / 2, H * 0.38 + 100);
       ctx.font = '600 16px system-ui, sans-serif';
       ctx.fillStyle = newBest ? '#ffd24d' : 'rgba(255,255,255,0.55)';
-      ctx.fillText(newBest ? 'NEW BEST!' : 'BEST ' + best, W / 2, H * 0.38 + 110);
+      ctx.fillText(newBest ? 'NEW BEST!' : 'BEST ' + best, W / 2, H * 0.38 + 130);
       ctx.fillStyle = 'rgba(255,255,255,0.8)';
       ctx.font = '600 18px system-ui, sans-serif';
-      ctx.fillText('Tap to play again', W / 2, H * 0.38 + 160);
+      ctx.fillText('Tap to play again', W / 2, H * 0.38 + 180);
     }
   }
 
+  // ---- Render: orbs -------------------------------------------------------
   function orbAlpha(o) {
     const fadeIn = Math.min(1, o.age / 0.3);
     const left = o.life - o.age;
@@ -422,17 +820,16 @@
     ctx.save();
     ctx.translate(o.x, o.y + bob);
     ctx.globalAlpha = a;
-    if (o.type === 'red') drawRed(r, o.seed);
+    if (o.type === 'red') drawRed(r, o.seed, o.vx);
     else if (o.type === 'green') drawGreen(r, o.seed);
     else drawBlue(r, o.seed);
     ctx.restore();
   }
 
-  function drawRed(r, seed) {
+  function drawRed(r, seed, vx) {
     const pulse = 0.5 + 0.5 * Math.sin(now * 6 + seed);
     ctx.shadowColor = '#ff1a1a'; ctx.shadowBlur = 16 + pulse * 14;
-    // rotating spikes
-    ctx.save(); ctx.rotate(now * 0.9 + seed);
+    ctx.save(); ctx.rotate(now * (vx ? Math.sign(vx) * 2.2 : 0.9) + seed);
     ctx.beginPath();
     const n = 10;
     for (let i = 0; i < n * 2; i++) {
@@ -441,12 +838,10 @@
     }
     ctx.closePath(); ctx.fillStyle = '#7a0010'; ctx.fill();
     ctx.restore();
-    // body
     const g = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r);
     g.addColorStop(0, '#ff4a3a'); g.addColorStop(0.55, '#c10018'); g.addColorStop(1, '#2a0008');
     ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
     ctx.shadowBlur = 0;
-    // angry glowing eyes
     for (const sx of [-1, 1]) {
       ctx.save(); ctx.translate(sx * r * 0.38, -r * 0.12); ctx.rotate(sx * 0.55);
       ctx.fillStyle = '#ffe14a'; ctx.shadowColor = '#ffe14a'; ctx.shadowBlur = 8;
@@ -455,7 +850,6 @@
       ctx.beginPath(); ctx.ellipse(0, 0, r * 0.05, r * 0.14, 0, 0, 7); ctx.fill();
       ctx.restore();
     }
-    // jagged grin
     ctx.fillStyle = '#12000a';
     ctx.beginPath(); ctx.moveTo(-r * 0.55, r * 0.3);
     ctx.quadraticCurveTo(0, r * 0.85, r * 0.55, r * 0.3);
@@ -471,14 +865,12 @@
   function drawGreen(r, seed) {
     const pulse = 0.5 + 0.5 * Math.sin(now * 4 + seed);
     ctx.shadowColor = '#5dff7a'; ctx.shadowBlur = 14 + pulse * 10;
-    // halo
     ctx.strokeStyle = 'rgba(160,255,170,0.55)'; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.arc(0, 0, r * (1.25 + pulse * 0.08), 0, 7); ctx.stroke();
     const g = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r);
     g.addColorStop(0, '#d8ffb0'); g.addColorStop(0.6, '#4be36a'); g.addColorStop(1, '#13a83a');
     ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
     ctx.shadowBlur = 0;
-    // happy face
     ctx.strokeStyle = '#0b4a1c'; ctx.lineWidth = Math.max(2, r * 0.1); ctx.lineCap = 'round';
     for (const sx of [-1, 1]) {
       ctx.beginPath(); ctx.arc(sx * r * 0.36, -r * 0.1, r * 0.17, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke();
@@ -486,7 +878,6 @@
     ctx.beginPath(); ctx.arc(0, r * 0.05, r * 0.5, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke();
     ctx.fillStyle = 'rgba(255,140,170,0.5)';
     for (const sx of [-1, 1]) { ctx.beginPath(); ctx.arc(sx * r * 0.58, r * 0.22, r * 0.12, 0, 7); ctx.fill(); }
-    // orbiting sparkles
     ctx.fillStyle = '#fff';
     for (let i = 0; i < 3; i++) {
       const ang = now * 1.6 + i * 2.094 + seed, d = r * 1.5;
@@ -510,7 +901,6 @@
     ctx.shadowBlur = 0;
     ctx.strokeStyle = 'rgba(190,225,255,0.8)'; ctx.lineWidth = 2;
     ctx.beginPath(); ctx.arc(0, 0, r * 1.18, 0, 7); ctx.stroke();
-    // shield glyph
     ctx.fillStyle = '#fff';
     ctx.beginPath();
     ctx.moveTo(0, -r * 0.55); ctx.lineTo(r * 0.45, -r * 0.35); ctx.lineTo(r * 0.4, r * 0.1);
@@ -522,11 +912,12 @@
     ctx.quadraticCurveTo(r * 0.18, r * 0.28, 0, r * 0.4); ctx.closePath(); ctx.fill();
   }
 
-  function roundRect(x, y, w, h, r) {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
-    ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  function draw() {
+    drawBackground();
+    drawWalls();
+    if (state === 'bonus') drawBonus(); else drawStage();
+    drawFlashes();
+    drawOverlays();
   }
 
   // ---- Loop ---------------------------------------------------------------
@@ -542,8 +933,16 @@
   reset();
   requestAnimationFrame(frame);
 
-  // test hook
-  window.__pull = { get state() { return state; }, get score() { return score; }, get mult() { return mult; }, get shield() { return shield; }, get orbs() { return orbs; }, spawn: spawnOrb, setOrbs: (a) => { orbs = a; }, get ball() { return ball; }, paddle: () => paddle };
+  // test hooks
+  window.__pull = {
+    get state() { return state; }, get score() { return score; }, get mult() { return mult; },
+    get shield() { return shield; }, get orbs() { return orbs; }, get ball() { return ball; },
+    get greens() { return greens; }, get bonus() { return bonus; }, get saved() { return saved; },
+    get mb() { return mb; }, get playTime() { return playTime; }, get death() { return deathMsg; },
+    paddle: () => paddle, holes: holeDefs,
+    spawn: spawnOrb, setOrbs: a => { orbs = a; }, setMult: m => { mult = m; },
+    setPlayTime: t => { playTime = t; }, setGreens: n => { greens = n; },
+  };
 })();
 </script>
 </body>
