@@ -32,6 +32,7 @@
   const ORB_LIFE = { red: 7, green: 6, blue: 7 };
   const RAMP_SECONDS = 100;     // play time until red orbs reach full difficulty
   const GREENS_FOR_BONUS = 5;
+  const MAX_SHIELDS = 3;
   const BONUS_BALLS = 3;
   const BONUS_TIME = 5;         // seconds per bonus ball
   const MID_POINTS = 1500, SIDE_POINTS = 250;
@@ -43,7 +44,7 @@
   let ball, paddle;
   let pointer = null;
   let flashes = [], trail = [];
-  let orbs = [], shield = false, spawnIn = 2.5, now = 0, lastT = 0;
+  let orbs = [], shields = 0, spawnIn = 2.5, now = 0, lastT = 0;
   let greens = 0, playTime = 0;
   let saved = null, bonus = null, mb = null, cd = null, goFlash = 0;
 
@@ -83,7 +84,7 @@
     state = 'ready';
     score = 0; mult = 1; newBest = false; deathMsg = '';
     greens = 0; playTime = 0; goFlash = 0;
-    flashes = []; trail = []; orbs = []; shield = false; spawnIn = 2.5;
+    flashes = []; trail = []; orbs = []; shields = 0; spawnIn = 2.5;
     saved = null; bonus = null; mb = null; cd = null; pointer = null;
     paddle.x = W / 2;
     placeBall();
@@ -141,7 +142,7 @@
     if (!force && orbs.length >= cap) return;
     let type = force;
     if (!type) {
-      const wts = { red: 45 + 40 * d, green: 32, blue: (shield || orbs.some(o => o.type === 'blue')) ? 0 : 18 };
+      const wts = { red: 45 + 40 * d, green: 32, blue: (shields >= MAX_SHIELDS || orbs.some(o => o.type === 'blue')) ? 0 : 18 };
       let roll = Math.random() * (wts.red + wts.green + wts.blue);
       type = 'red';
       for (const k of ['red', 'green', 'blue']) { roll -= wts[k]; if (roll <= 0) { type = k; break; } }
@@ -168,9 +169,9 @@
   // Returns true if the update loop must stop (game over / bonus began).
   function hitOrb(o) {
     if (o.type === 'red') {
-      if (shield) {
-        shield = false; orbs.splice(orbs.indexOf(o), 1);
-        popFlash(o.x, o.y, 'SHIELD!', '#4da3ff'); beep(660);
+      if (shields > 0) {
+        shields--; orbs.splice(orbs.indexOf(o), 1);
+        popFlash(o.x, o.y, shields ? 'BLOCKED! ' + shields + ' left' : 'BLOCKED!', '#4da3ff'); beep(660);
         return false;
       }
       gameOver('Touched a red orb');
@@ -183,8 +184,8 @@
       popFlash(o.x, o.y, 'POWER UP!', '#5dff7a'); beep(880);
       if (greens >= GREENS_FOR_BONUS) { startBonus(); return true; }
     } else {
-      shield = true;
-      popFlash(o.x, o.y, 'SHIELD', '#4da3ff'); beep(520);
+      shields = Math.min(MAX_SHIELDS, shields + 1);
+      popFlash(o.x, o.y, 'SHIELD x' + shields, '#4da3ff'); beep(520);
     }
     return false;
   }
@@ -263,7 +264,7 @@
     saved = { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy, px: paddle.x };
     orbs = []; trail = []; pointer = null; greens = 0;
     state = 'bonus';
-    bonus = { phase: 'intro', t: 0, idx: 0, total: 0, results: [], timeLeft: BONUS_TIME, msg: '', hole: null };
+    bonus = { phase: 'intro', t: 0, clock: 0, flight: 0, idx: 0, total: 0, results: [], timeLeft: BONUS_TIME, msg: '', hole: null };
     mb = null;
     beep(990);
   }
@@ -271,7 +272,7 @@
   function beginBall() {
     const s = bonusStart();
     mb = { x: s.x, y: s.y, r: ball.r, vx: 0, vy: 0 };
-    bonus.phase = 'aim'; bonus.t = 0; bonus.timeLeft = BONUS_TIME; bonus.hole = null;
+    bonus.phase = 'aim'; bonus.t = 0; bonus.timeLeft = BONUS_TIME; bonus.flight = 0; bonus.hole = null;
     trail = [];
   }
 
@@ -287,15 +288,16 @@
 
   function updateBonus(dt) {
     const b = bonus;
-    b.t += dt;
+    b.t += dt; b.clock += dt;
     if (b.phase === 'intro') {
       if (b.t > 2.2) beginBall();
-    } else if (b.phase === 'aim' || b.phase === 'fly') {
-      b.timeLeft -= dt;
-      if (b.phase === 'fly') flyBonusBall(dt);
-      if (bonus.phase !== 'sink' && bonus.phase !== 'between' && b.timeLeft <= 0) {
-        endBall(0, "TIME'S UP");
-      }
+    } else if (b.phase === 'aim') {
+      b.timeLeft -= dt;               // the 5 seconds only run while you aim
+      if (b.timeLeft <= 0) endBall(0, "TIME'S UP");
+    } else if (b.phase === 'fly') {
+      b.flight += dt;
+      flyBonusBall(dt);
+      if (b.phase === 'fly' && b.flight > 12) endBall(0, 'MISSED');
     } else if (b.phase === 'sink') {
       if (b.t >= 0.4) {
         const h = b.hole, cy = ceilY();
@@ -314,12 +316,33 @@
     }
   }
 
+  // The block sweeps back and forth across all three holes, just under the ceiling.
+  function blockRect() {
+    const hs = holeDefs(), r = ball.r, cy = ceilY();
+    const off = hs[2].x - hs[1].x;
+    return { x: W / 2 + off * Math.sin(bonus.clock * 2.0), y: cy + r * 6, hw: r * 2.7, hh: r * 0.9 };
+  }
+
+  function blockCollide() {
+    const bl = blockRect(), r = mb.r;
+    const px = clamp(mb.x, bl.x - bl.hw, bl.x + bl.hw), py = clamp(mb.y, bl.y - bl.hh, bl.y + bl.hh);
+    let dx = mb.x - px, dy = mb.y - py;
+    const d = Math.hypot(dx, dy);
+    if (d >= r) return;
+    let nx, ny;
+    if (d < 1e-6) { nx = 0; ny = 1; mb.y = bl.y + bl.hh + r; }       // centre inside: push down
+    else { nx = dx / d; ny = dy / d; mb.x = px + nx * r; mb.y = py + ny * r; }
+    const dot = mb.vx * nx + mb.vy * ny;
+    if (dot < 0) { mb.vx -= 2 * dot * nx; mb.vy -= 2 * dot * ny; beep(180); }
+  }
+
   function flyBonusBall(dt) {
     const r = mb.r, cy = ceilY();
     const steps = Math.max(1, Math.ceil(Math.hypot(mb.vx, mb.vy) * dt / (r * 0.6)));
     const h = dt / steps;
     for (let i = 0; i < steps; i++) {
       mb.x += mb.vx * h; mb.y += mb.vy * h;
+      blockCollide();
       if (mb.x < r) { mb.x = r; mb.vx = Math.abs(mb.vx); }
       else if (mb.x > W - r) { mb.x = W - r; mb.vx = -Math.abs(mb.vx); }
       if (mb.vy < 0 && mb.y - r <= cy) {
@@ -598,10 +621,10 @@
     ctx.fillStyle = bs.col; ctx.shadowColor = bs.col; ctx.shadowBlur = bs.glow;
     ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r, 0, 7); ctx.fill();
     ctx.shadowBlur = 0; ctx.globalAlpha = 1;
-    if (shield) {
-      ctx.strokeStyle = `rgba(90,170,255,${0.7 + 0.3 * Math.sin(now * 8)})`; ctx.lineWidth = 3;
+    for (let i = 0; i < shields; i++) {
+      ctx.strokeStyle = `rgba(90,170,255,${0.7 + 0.3 * Math.sin(now * 8 - i)})`; ctx.lineWidth = 3;
       ctx.shadowColor = '#4da3ff'; ctx.shadowBlur = 14;
-      ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r + 6, 0, 7); ctx.stroke();
+      ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r + 6 + i * 6, 0, 7); ctx.stroke();
       ctx.shadowBlur = 0;
     }
 
@@ -622,7 +645,7 @@
       ctx.fillText('Drag left and right to move the paddle', W / 2, H * 0.5 + 50);
       ctx.fillStyle = '#ff6b6b'; ctx.fillText('Red orbs end the game', W / 2, H * 0.5 + 82);
       ctx.fillStyle = '#6dff85'; ctx.fillText('Green orbs recharge your ball', W / 2, H * 0.5 + 104);
-      ctx.fillStyle = '#6db4ff'; ctx.fillText('Blue orbs block one red orb', W / 2, H * 0.5 + 126);
+      ctx.fillStyle = '#6db4ff'; ctx.fillText('Blue orbs block red orbs (stack to 3)', W / 2, H * 0.5 + 126);
       ctx.fillStyle = '#ff8ae8'; ctx.fillText('5 green orbs = bonus round', W / 2, H * 0.5 + 148);
       ctx.fillStyle = 'rgba(255,255,255,0.4)'; ctx.fillText('A ball with no power dies!', W / 2, H * 0.5 + 176);
     }
@@ -655,6 +678,26 @@
     }
     ctx.restore();
 
+    // moving block
+    {
+      const bl = blockRect();
+      ctx.save();
+      ctx.globalAlpha = b.phase === 'intro' ? fade : 1;
+      ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 16;
+      roundRect(bl.x - bl.hw, bl.y - bl.hh, bl.hw * 2, bl.hh * 2, 6);
+      ctx.fillStyle = '#2a0d3d'; ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.save(); ctx.clip();
+      ctx.strokeStyle = 'rgba(255,79,216,0.55)'; ctx.lineWidth = 5;
+      for (let sx = bl.x - bl.hw - bl.hh * 2; sx < bl.x + bl.hw + bl.hh * 2; sx += 14) {
+        ctx.beginPath(); ctx.moveTo(sx, bl.y + bl.hh); ctx.lineTo(sx + bl.hh * 2, bl.y - bl.hh); ctx.stroke();
+      }
+      ctx.restore();
+      roundRect(bl.x - bl.hw, bl.y - bl.hh, bl.hw * 2, bl.hh * 2, 6);
+      ctx.strokeStyle = '#ff7ae6'; ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.restore();
+    }
+
     // HUD
     ctx.fillStyle = '#ff7ae6'; ctx.shadowColor = '#ff4fd8'; ctx.shadowBlur = 14;
     ctx.font = '800 20px system-ui, sans-serif';
@@ -673,7 +716,7 @@
     }
 
     // timer
-    if (b.phase === 'aim' || b.phase === 'fly' || b.phase === 'sink') {
+    if (b.phase === 'aim') {
       const frac = clamp(b.timeLeft / BONUS_TIME, 0, 1);
       const bw = Math.min(W * 0.6, 260), bx = W / 2 - bw / 2, by = H - 30;
       const danger = b.timeLeft < 1.5;
@@ -693,7 +736,7 @@
         const pi = pointer ? pullInfo() : null;
         if (pi && pi.valid) {
           const col = drawRubberBand(pi);
-          drawPath(mb.x, mb.y, pi.ux, pi.uy, H * (0.35 + 0.6 * pi.power), cy, col, 1);
+          drawPath(mb.x, mb.y, pi.ux, pi.uy, H * 0.05 + H * 0.04 * pi.power, cy, col, 1);
         } else if (!pointer) {
           ctx.fillStyle = 'rgba(255,255,255,0.75)';
           ctx.font = '600 16px system-ui, sans-serif';
@@ -731,7 +774,9 @@
       ctx.fillStyle = '#ffd24d';
       ctx.fillText('Small middle hole = ' + MID_POINTS + ' points', W / 2, H * 0.45 + 62);
       ctx.fillStyle = 'rgba(255,255,255,0.6)';
-      ctx.fillText(BONUS_TIME + ' seconds per ball', W / 2, H * 0.45 + 90);
+      ctx.fillText(BONUS_TIME + ' seconds to shoot each ball', W / 2, H * 0.45 + 90);
+      ctx.fillStyle = '#ff9ae8';
+      ctx.fillText('Watch out for the moving block!', W / 2, H * 0.45 + 118);
       ctx.globalAlpha = 1;
     } else if (b.phase === 'between') {
       ctx.fillStyle = b.msg.charAt(0) === '+' ? '#ffd24d' : '#ff6b8a';
@@ -936,7 +981,7 @@
   // test hooks
   window.__pull = {
     get state() { return state; }, get score() { return score; }, get mult() { return mult; },
-    get shield() { return shield; }, get orbs() { return orbs; }, get ball() { return ball; },
+    get shields() { return shields; }, get orbs() { return orbs; }, get ball() { return ball; },
     get greens() { return greens; }, get bonus() { return bonus; }, get saved() { return saved; },
     get mb() { return mb; }, get playTime() { return playTime; }, get death() { return deathMsg; },
     paddle: () => paddle, holes: holeDefs,
