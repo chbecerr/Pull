@@ -26,6 +26,12 @@
   const BASE_POINTS = 10;       // points per bounce before multiplier
   const MAX_PULL = 0.38;        // full pull distance, fraction of screen height
   const MIN_PULL_PX = 24;       // shorter pulls are cancelled
+  const ORB_BOOST = 3;          // multiplier added by a green orb
+  const ORB_TYPES = {
+    red:   { life: 7, w: 55 },
+    green: { life: 6, w: 25 },
+    blue:  { life: 7, w: 20 },
+  };
   const MIN_ANGLE = 18 * Math.PI / 180; // keep launches off the horizontal
 
   // ---- State --------------------------------------------------------------
@@ -37,6 +43,7 @@
   let flashes = [];             // bounce ring effects
   let trail = [];
   let lastT = 0;
+  let orbs = [], shield = false, spawnIn = 2.5, now = 0;
 
   try { best = parseInt(localStorage.getItem('pull-best') || '0', 10) || 0; } catch (e) {}
 
@@ -58,6 +65,7 @@
     state = 'ready';
     score = 0; mult = 1; newBest = false;
     flashes = []; trail = [];
+    orbs = []; shield = false; spawnIn = 2.5;
     paddle.x = W / 2;
     ball.x = paddle.x;
     ball.y = paddle.y - paddle.h / 2 - ball.r;
@@ -84,6 +92,46 @@
     }
     const power = clamp(len / (MAX_PULL * H), 0, 1);
     return { valid: true, ux, uy, power, mult: 1 + (MAX_MULT - 1) * power, len };
+  }
+
+  function spawnOrb() {
+    if (orbs.length >= 4) return;
+    let pool = Object.keys(ORB_TYPES).filter(k => !(k === 'blue' && (shield || orbs.some(o => o.type === 'blue'))));
+    let total = pool.reduce((a, k) => a + ORB_TYPES[k].w, 0), roll = Math.random() * total, type = pool[0];
+    for (const k of pool) { roll -= ORB_TYPES[k].w; if (roll <= 0) { type = k; break; } }
+    const r = Math.max(15, Math.min(W, H) * 0.045);
+    const top = Math.max(150, H * 0.3), bottom = paddle.y - 90;
+    for (let tries = 0; tries < 25; tries++) {
+      const x = r * 1.6 + Math.random() * (W - r * 3.2);
+      const y = top + Math.random() * Math.max(10, bottom - top);
+      if (Math.hypot(x - ball.x, y - ball.y) < r * 5) continue;
+      if (orbs.some(o => Math.hypot(x - o.x, y - o.y) < r * 3)) continue;
+      orbs.push({ type, x, y, r, age: 0, life: ORB_TYPES[type].life, seed: Math.random() * 6.28 });
+      return;
+    }
+  }
+
+  function popFlash(x, y, txt, col) { flashes.push({ x, y, t: 0, txt, col }); }
+
+  function hitOrb(o) {
+    if (o.type === 'red') {
+      if (shield) {
+        shield = false; orbs.splice(orbs.indexOf(o), 1);
+        popFlash(o.x, o.y, 'SHIELD!', '#4da3ff'); beep(660);
+        return false;
+      }
+      gameOver();
+      return true;
+    }
+    orbs.splice(orbs.indexOf(o), 1);
+    if (o.type === 'green') {
+      mult = Math.min(MAX_MULT, mult + ORB_BOOST);
+      popFlash(o.x, o.y, 'SPEED UP!', '#5dff7a'); beep(880);
+    } else {
+      shield = true;
+      popFlash(o.x, o.y, 'SHIELD', '#4da3ff'); beep(520);
+    }
+    return false;
   }
 
   function bounce(x, y) {
@@ -169,6 +217,12 @@
     flashes = flashes.filter(f => f.t < 0.7);
     if (state !== 'playing') return;
 
+    // Orbs: age, expire, spawn
+    for (const o of orbs) o.age += dt;
+    orbs = orbs.filter(o => o.age < o.life);
+    spawnIn -= dt;
+    if (spawnIn <= 0) { spawnOrb(); spawnIn = 2 + Math.random() * 2.5; }
+
     // Multiplier decays; ball speed follows it.
     mult = 1 + (mult - 1) * Math.pow(0.5, dt / HALF_LIFE);
     if (mult < 1.005) mult = 1;
@@ -197,6 +251,14 @@
         ball.vx = Math.sin(ang) * s; ball.vy = -Math.cos(ang) * s;
         ball.y = top - ball.r;
         bounce(ball.x, top);
+      }
+
+      for (let k = orbs.length - 1; k >= 0; k--) {
+        const o = orbs[k];
+        if (o.age < 0.3) continue;
+        if (Math.hypot(ball.x - o.x, ball.y - o.y) < o.r * 0.9 + ball.r) {
+          if (hitOrb(o)) return;
+        }
       }
 
       if (ball.y - ball.r > H) { gameOver(); return; }
@@ -283,12 +345,15 @@
     for (const f of flashes) {
       const k = f.t / 0.7;
       ctx.globalAlpha = 1 - k;
-      ctx.strokeStyle = multColor(mult); ctx.lineWidth = 2;
+      ctx.strokeStyle = f.col || multColor(mult); ctx.lineWidth = 2;
       ctx.beginPath(); ctx.arc(f.x, f.y, ball.r + k * 26, 0, 7); ctx.stroke();
-      ctx.fillStyle = '#fff'; ctx.font = '700 14px system-ui, sans-serif';
-      ctx.fillText('+' + f.pts, f.x, f.y - 14 - k * 24);
+      ctx.fillStyle = f.col || '#fff'; ctx.font = '700 14px system-ui, sans-serif';
+      ctx.fillText(f.txt || '+' + f.pts, f.x, f.y - 14 - k * 24);
       ctx.globalAlpha = 1;
     }
+
+    // orbs
+    for (const o of orbs) drawOrb(o);
 
     // paddle
     ctx.fillStyle = '#e8eeff'; ctx.shadowColor = '#7aa2ff'; ctx.shadowBlur = 14;
@@ -306,6 +371,12 @@
     ctx.fillStyle = bc; ctx.shadowColor = bc; ctx.shadowBlur = 18;
     ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r, 0, 7); ctx.fill();
     ctx.shadowBlur = 0;
+    if (shield) {
+      ctx.strokeStyle = `rgba(90,170,255,${0.7 + 0.3 * Math.sin(now * 8)})`; ctx.lineWidth = 3;
+      ctx.shadowColor = '#4da3ff'; ctx.shadowBlur = 14;
+      ctx.beginPath(); ctx.arc(ball.x, ball.y, ball.r + 6, 0, 7); ctx.stroke();
+      ctx.shadowBlur = 0;
+    }
 
     // messages
     ctx.textAlign = 'center';
@@ -317,6 +388,9 @@
       ctx.fillStyle = 'rgba(255,255,255,0.5)';
       ctx.fillText('Harder pull = faster ball = bigger multiplier', W / 2, H * 0.5 + 28);
       ctx.fillText('Then drag left and right to move the paddle', W / 2, H * 0.5 + 50);
+      ctx.fillStyle = '#ff6b6b'; ctx.fillText('Red orbs end the game', W / 2, H * 0.5 + 82);
+      ctx.fillStyle = '#6dff85'; ctx.fillText('Green orbs boost your speed', W / 2, H * 0.5 + 104);
+      ctx.fillStyle = '#6db4ff'; ctx.fillText('Blue orbs block one red orb', W / 2, H * 0.5 + 126);
     }
     if (state === 'over') {
       ctx.fillStyle = 'rgba(5,5,12,0.72)'; ctx.fillRect(0, 0, W, H);
@@ -335,6 +409,119 @@
     }
   }
 
+  function orbAlpha(o) {
+    const fadeIn = Math.min(1, o.age / 0.3);
+    const left = o.life - o.age;
+    const blink = left < 1.5 ? (Math.sin(left * 18) > 0 ? 1 : 0.25) : 1;
+    return fadeIn * blink;
+  }
+
+  function drawOrb(o) {
+    const a = orbAlpha(o), r = o.r * (0.5 + 0.5 * Math.min(1, o.age / 0.3));
+    const bob = Math.sin(now * 2 + o.seed) * 3;
+    ctx.save();
+    ctx.translate(o.x, o.y + bob);
+    ctx.globalAlpha = a;
+    if (o.type === 'red') drawRed(r, o.seed);
+    else if (o.type === 'green') drawGreen(r, o.seed);
+    else drawBlue(r, o.seed);
+    ctx.restore();
+  }
+
+  function drawRed(r, seed) {
+    const pulse = 0.5 + 0.5 * Math.sin(now * 6 + seed);
+    ctx.shadowColor = '#ff1a1a'; ctx.shadowBlur = 16 + pulse * 14;
+    // rotating spikes
+    ctx.save(); ctx.rotate(now * 0.9 + seed);
+    ctx.beginPath();
+    const n = 10;
+    for (let i = 0; i < n * 2; i++) {
+      const ang = (i / (n * 2)) * Math.PI * 2, rr = i % 2 ? r * 0.92 : r * 1.4;
+      ctx[i ? 'lineTo' : 'moveTo'](Math.cos(ang) * rr, Math.sin(ang) * rr);
+    }
+    ctx.closePath(); ctx.fillStyle = '#7a0010'; ctx.fill();
+    ctx.restore();
+    // body
+    const g = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r);
+    g.addColorStop(0, '#ff4a3a'); g.addColorStop(0.55, '#c10018'); g.addColorStop(1, '#2a0008');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+    // angry glowing eyes
+    for (const sx of [-1, 1]) {
+      ctx.save(); ctx.translate(sx * r * 0.38, -r * 0.12); ctx.rotate(sx * 0.55);
+      ctx.fillStyle = '#ffe14a'; ctx.shadowColor = '#ffe14a'; ctx.shadowBlur = 8;
+      ctx.beginPath(); ctx.ellipse(0, 0, r * 0.3, r * 0.15, 0, 0, 7); ctx.fill();
+      ctx.shadowBlur = 0; ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.ellipse(0, 0, r * 0.05, r * 0.14, 0, 0, 7); ctx.fill();
+      ctx.restore();
+    }
+    // jagged grin
+    ctx.fillStyle = '#12000a';
+    ctx.beginPath(); ctx.moveTo(-r * 0.55, r * 0.3);
+    ctx.quadraticCurveTo(0, r * 0.85, r * 0.55, r * 0.3);
+    ctx.quadraticCurveTo(0, r * 0.5, -r * 0.55, r * 0.3); ctx.fill();
+    ctx.fillStyle = '#fff';
+    for (let i = -2; i <= 2; i++) {
+      const x = i * r * 0.2, y = r * 0.4 + (1 - Math.abs(i) * 0.25) * r * 0.1;
+      ctx.beginPath(); ctx.moveTo(x - r * 0.07, y - r * 0.08); ctx.lineTo(x + r * 0.07, y - r * 0.08);
+      ctx.lineTo(x, y + r * 0.1); ctx.closePath(); ctx.fill();
+    }
+  }
+
+  function drawGreen(r, seed) {
+    const pulse = 0.5 + 0.5 * Math.sin(now * 4 + seed);
+    ctx.shadowColor = '#5dff7a'; ctx.shadowBlur = 14 + pulse * 10;
+    // halo
+    ctx.strokeStyle = 'rgba(160,255,170,0.55)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, r * (1.25 + pulse * 0.08), 0, 7); ctx.stroke();
+    const g = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r);
+    g.addColorStop(0, '#d8ffb0'); g.addColorStop(0.6, '#4be36a'); g.addColorStop(1, '#13a83a');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+    // happy face
+    ctx.strokeStyle = '#0b4a1c'; ctx.lineWidth = Math.max(2, r * 0.1); ctx.lineCap = 'round';
+    for (const sx of [-1, 1]) {
+      ctx.beginPath(); ctx.arc(sx * r * 0.36, -r * 0.1, r * 0.17, Math.PI * 1.1, Math.PI * 1.9); ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(0, r * 0.05, r * 0.5, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke();
+    ctx.fillStyle = 'rgba(255,140,170,0.5)';
+    for (const sx of [-1, 1]) { ctx.beginPath(); ctx.arc(sx * r * 0.58, r * 0.22, r * 0.12, 0, 7); ctx.fill(); }
+    // orbiting sparkles
+    ctx.fillStyle = '#fff';
+    for (let i = 0; i < 3; i++) {
+      const ang = now * 1.6 + i * 2.094 + seed, d = r * 1.5;
+      star(Math.cos(ang) * d, Math.sin(ang) * d, r * 0.17);
+    }
+  }
+
+  function star(x, y, s) {
+    ctx.beginPath();
+    ctx.moveTo(x, y - s); ctx.quadraticCurveTo(x, y, x + s, y);
+    ctx.quadraticCurveTo(x, y, x, y + s); ctx.quadraticCurveTo(x, y, x - s, y);
+    ctx.quadraticCurveTo(x, y, x, y - s); ctx.fill();
+  }
+
+  function drawBlue(r, seed) {
+    const pulse = 0.5 + 0.5 * Math.sin(now * 3 + seed);
+    ctx.shadowColor = '#4da3ff'; ctx.shadowBlur = 14 + pulse * 8;
+    const g = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r);
+    g.addColorStop(0, 'rgba(200,235,255,0.95)'); g.addColorStop(0.6, 'rgba(60,140,255,0.85)'); g.addColorStop(1, 'rgba(20,70,200,0.9)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = 'rgba(190,225,255,0.8)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, r * 1.18, 0, 7); ctx.stroke();
+    // shield glyph
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.moveTo(0, -r * 0.55); ctx.lineTo(r * 0.45, -r * 0.35); ctx.lineTo(r * 0.4, r * 0.1);
+    ctx.quadraticCurveTo(r * 0.3, r * 0.45, 0, r * 0.62);
+    ctx.quadraticCurveTo(-r * 0.3, r * 0.45, -r * 0.4, r * 0.1);
+    ctx.lineTo(-r * 0.45, -r * 0.35); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = 'rgba(40,110,230,0.9)';
+    ctx.beginPath(); ctx.moveTo(0, -r * 0.35); ctx.lineTo(r * 0.27, -r * 0.22); ctx.lineTo(r * 0.24, r * 0.06);
+    ctx.quadraticCurveTo(r * 0.18, r * 0.28, 0, r * 0.4); ctx.closePath(); ctx.fill();
+  }
+
   function roundRect(x, y, w, h, r) {
     ctx.beginPath();
     ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
@@ -345,7 +532,7 @@
   // ---- Loop ---------------------------------------------------------------
   function frame(t) {
     const dt = Math.min(0.033, (t - lastT) / 1000 || 0);
-    lastT = t;
+    lastT = t; now = t / 1000;
     update(dt);
     draw();
     requestAnimationFrame(frame);
@@ -356,7 +543,7 @@
   requestAnimationFrame(frame);
 
   // test hook
-  window.__pull = { get state() { return state; }, get score() { return score; }, get mult() { return mult; }, get ball() { return ball; }, paddle: () => paddle };
+  window.__pull = { get state() { return state; }, get score() { return score; }, get mult() { return mult; }, get shield() { return shield; }, get orbs() { return orbs; }, spawn: spawnOrb, setOrbs: (a) => { orbs = a; }, get ball() { return ball; }, paddle: () => paddle };
 })();
 </script>
 </body>
